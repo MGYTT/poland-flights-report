@@ -4,7 +4,9 @@ import { createPublicClient } from '@/lib/supabase-server';
 
 export default async function DashboardPage() {
   const supabase = createPublicClient();
-  const today = new Date().toISOString().split('T')[0];
+  const yesterday = new Date();
+yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+const today = yesterday.toISOString().split('T')[0];
   const dateFormatted = new Date(today).toLocaleDateString('pl-PL', {
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
   });
