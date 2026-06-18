@@ -6,6 +6,7 @@ import {
   ICAO_TO_IATA,
 } from '@/lib/airlabs';
 import { createServiceClient } from '@/lib/supabase-server';
+import { revalidatePath } from 'next/cache';
 
 // Pełna mapa IATA → polska nazwa linii
 const AIRLINE_NAMES: Record<string, string> = {
@@ -151,7 +152,8 @@ export async function GET(request: Request) {
   ]);
 
   console.log(`\n✅ GOTOWE — zapisano dane za ${reportDate}`);
-
+revalidatePath('/dashboard');
+revalidatePath('/');
   return NextResponse.json({
     success: true,
     date: reportDate,
