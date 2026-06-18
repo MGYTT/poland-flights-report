@@ -1,85 +1,58 @@
 import { NextResponse } from 'next/server';
-import { getArrivals, getDepartures, POLISH_AIRPORTS } from '@/lib/opensky';
-import { getAirlineName } from '@/lib/airlines';
+import {
+  getArrivals,
+  getDepartures,
+  POLISH_AIRPORTS,
+  ICAO_TO_IATA,
+} from '@/lib/airlabs';
 import { createServiceClient } from '@/lib/supabase-server';
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const secret = searchParams.get('secret');
-  if (secret !== process.env.CRON_SECRET) {
+  if (searchParams.get('secret') !== process.env.CRON_SECRET) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   const supabase = createServiceClient();
+  const reportDate = new Date().toISOString().split('T')[0];
 
-  // OpenSky wymaga zakresu >2 dni UTC dla departures
-  // Pobieramy: przedwczoraj 00:00 → wczoraj 23:59:59 UTC
-  const now = new Date();
-
-  const twoDaysAgo = new Date(now);
-  twoDaysAgo.setUTCDate(now.getUTCDate() - 2);
-  const dayStart = Math.floor(new Date(Date.UTC(
-    twoDaysAgo.getUTCFullYear(),
-    twoDaysAgo.getUTCMonth(),
-    twoDaysAgo.getUTCDate(), 0, 0, 0
-  )).getTime() / 1000);
-
-  const yesterday = new Date(now);
-  yesterday.setUTCDate(now.getUTCDate() - 1);
-  const dayEnd = Math.floor(new Date(Date.UTC(
-    yesterday.getUTCFullYear(),
-    yesterday.getUTCMonth(),
-    yesterday.getUTCDate(), 23, 59, 59
-  )).getTime() / 1000);
-
-  const reportDate = yesterday.toISOString().split('T')[0];
-
-  console.log(`📊 Zbieranie danych za: ${reportDate} (${dayStart} → ${dayEnd})`);
+  console.log(`📊 Start zbierania: ${reportDate}`);
 
   let allArrivals: any[] = [];
   let allDepartures: any[] = [];
   const airportData: any[] = [];
-  const errors: string[] = [];
 
   for (const [icao, name] of Object.entries(POLISH_AIRPORTS)) {
-    console.log(`✈️  Pobieram: ${icao} — ${name}`);
+    const iata = ICAO_TO_IATA[icao];
+    if (!iata) continue;
 
-    const arrivals = await getArrivals(icao, dayStart, dayEnd);
-    await new Promise(r => setTimeout(r, 2000));
+    console.log(`✈️  ${icao} (${iata}) — ${name}`);
 
-    const departures = await getDepartures(icao, dayStart, dayEnd);
-    await new Promise(r => setTimeout(r, 2000));
+    const arrivals = await getArrivals(iata);
+    await new Promise(r => setTimeout(r, 1000));
+    const departures = await getDepartures(iata);
+    await new Promise(r => setTimeout(r, 1000));
 
-    if (!Array.isArray(arrivals)) {
-      errors.push(`${icao} arrivals: nieoczekiwana odpowiedź`);
-    }
-    if (!Array.isArray(departures)) {
-      errors.push(`${icao} departures: nieoczekiwana odpowiedź`);
-    }
-
-    const safeArrivals = Array.isArray(arrivals) ? arrivals : [];
-    const safeDepartures = Array.isArray(departures) ? departures : [];
-
-    allArrivals = [...allArrivals, ...safeArrivals];
-    allDepartures = [...allDepartures, ...safeDepartures];
+    allArrivals = [...allArrivals, ...arrivals];
+    allDepartures = [...allDepartures, ...departures];
 
     airportData.push({
       report_date: reportDate,
       airport_icao: icao,
       airport_name: name,
-      arrivals: safeArrivals.length,
-      departures: safeDepartures.length,
+      arrivals: arrivals.length,
+      departures: departures.length,
     });
 
-    console.log(`   ✅ ${icao}: ${safeArrivals.length} przylotów, ${safeDepartures.length} odlotów`);
+    console.log(`   ✅ ${arrivals.length} przylotów | ${departures.length} odlotów`);
   }
 
   // === TRASY ===
   const routeMap: Record<string, number> = {};
-  for (const flight of allArrivals) {
-    const origin = flight.estDepartureAirport;
-    const dest = flight.estArrivalAirport;
-    if (origin && dest && origin !== dest) {
+  for (const f of allArrivals) {
+    const origin = f.dep_iata;
+    const dest = f.arr_iata;
+    if (origin && dest) {
       const route = `${origin}→${dest}`;
       routeMap[route] = (routeMap[route] || 0) + 1;
     }
@@ -88,32 +61,39 @@ export async function GET(request: Request) {
 
   // === LINIE LOTNICZE ===
   const airlineMap: Record<string, number> = {};
-  for (const flight of [...allArrivals, ...allDepartures]) {
-    if (flight.callsign && flight.callsign.trim() !== '') {
-      const airline = getAirlineName(flight.callsign);
+  for (const f of [...allArrivals, ...allDepartures]) {
+    // AirLabs zwraca airline_iata i airline_name bezpośrednio!
+    const airline = f.airline_name || f.airline_iata || f.airline_icao;
+    if (airline && airline.trim() !== '') {
       airlineMap[airline] = (airlineMap[airline] || 0) + 1;
     }
   }
   const topAirline = Object.entries(airlineMap).sort((a, b) => b[1] - a[1])[0];
 
-  // === ZAPIS GŁÓWNY RAPORT ===
-  const { error: reportError } = await supabase.from('daily_reports').upsert({
+  // === MODELE SAMOLOTÓW ===
+  const aircraftMap: Record<string, number> = {};
+  for (const f of [...allArrivals, ...allDepartures]) {
+    const model = f.aircraft_icao || f.aircraft_iata;
+    if (model && model.trim() !== '') {
+      aircraftMap[model] = (aircraftMap[model] || 0) + 1;
+    }
+  }
+  const topAircraft = Object.entries(aircraftMap).sort((a, b) => b[1] - a[1])[0];
+
+  // === ZAPIS DO SUPABASE ===
+  await supabase.from('daily_reports').upsert({
     report_date: reportDate,
     total_arrivals: allArrivals.length,
     total_departures: allDepartures.length,
     top_route: topRoute ? `${topRoute[0]} (${topRoute[1]}x)` : null,
     top_airline: topAirline ? `${topAirline[0]} (${topAirline[1]} lotów)` : null,
+    top_aircraft_model: topAircraft ? `${topAircraft[0]} (${topAircraft[1]}x)` : null,
   });
-  if (reportError) console.error('DB report error:', reportError);
 
-  // === ZAPIS LOTNISKA ===
-  const { error: airportError } = await supabase.from('airport_stats').upsert(airportData);
-  if (airportError) console.error('DB airport error:', airportError);
+  await supabase.from('airport_stats').upsert(airportData);
 
-  // === ZAPIS LINII LOTNICZYCH ===
   const airlineRows = Object.entries(airlineMap)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
+    .sort((a, b) => b[1] - a[1]).slice(0, 20)
     .map(([name, count]) => ({
       report_date: reportDate,
       callsign: name,
@@ -121,26 +101,17 @@ export async function GET(request: Request) {
       flight_count: count,
     }));
   if (airlineRows.length > 0) {
-    const { error: airlineError } = await supabase.from('airline_stats').upsert(airlineRows);
-    if (airlineError) console.error('DB airline error:', airlineError);
+    await supabase.from('airline_stats').upsert(airlineRows);
   }
 
-  // === ZAPIS TRAS ===
   const routeRows = Object.entries(routeMap)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 30)
+    .sort((a, b) => b[1] - a[1]).slice(0, 30)
     .map(([route, count]) => {
       const [origin, destination] = route.split('→');
-      return {
-        report_date: reportDate,
-        origin,
-        destination,
-        flight_count: count,
-      };
+      return { report_date: reportDate, origin, destination, flight_count: count };
     });
   if (routeRows.length > 0) {
-    const { error: routeError } = await supabase.from('route_stats').upsert(routeRows);
-    if (routeError) console.error('DB route error:', routeError);
+    await supabase.from('route_stats').upsert(routeRows);
   }
 
   return NextResponse.json({
@@ -148,9 +119,9 @@ export async function GET(request: Request) {
     date: reportDate,
     totalArrivals: allArrivals.length,
     totalDepartures: allDepartures.length,
+    topRoute: topRoute?.[0] ?? null,
+    topAirline: topAirline?.[0] ?? null,
+    topAircraft: topAircraft?.[0] ?? null,
     airports: airportData,
-    topRoute: topRoute ? topRoute[0] : null,
-    topAirline: topAirline ? topAirline[0] : null,
-    errors: errors.length > 0 ? errors : undefined,
   });
 }
